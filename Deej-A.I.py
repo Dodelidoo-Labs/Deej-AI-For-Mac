@@ -25,6 +25,52 @@ import random
 import shutil
 import time
 import argparse
+from pathlib import PurePosixPath
+
+# use TF Keras everywhere
+from tensorflow.keras.models import load_model as tf_load_model
+from tensorflow.keras.layers import SeparableConv2D as _SeparableConv2D, LeakyReLU
+import tensorflow as tf  # already imported later, but we need it here
+
+# --- legacy loss shim (old 'cosine_proximity') ---
+def _cosine_proximity(y_true, y_pred):
+    y_true = tf.math.l2_normalize(y_true, axis=-1)
+    y_pred = tf.math.l2_normalize(y_pred, axis=-1)
+    return -tf.reduce_sum(y_true * y_pred, axis=-1)
+
+# --- SeparableConv2D config shim (strip legacy kwargs that Keras 3 rejects) ---
+def SeparableConv2D_compat(*args, **kwargs):
+    for bad in [
+        "groups", "kernel_initializer", "kernel_regularizer", "kernel_constraint",
+        "bias_regularizer", "bias_constraint", "activity_regularizer"
+    ]:
+        kwargs.pop(bad, None)
+    return _SeparableConv2D(*args, **kwargs)
+
+# --- helper to load 'speccy_model' with/without extension ---
+def _load_speccy_model(path_like: str):
+    candidates = [path_like]
+    root, ext = os.path.splitext(path_like)
+    if not ext:
+        candidates += [path_like + ".h5", path_like + ".keras"]
+    last_err = None
+    for p in candidates:
+        if not os.path.isfile(p):
+            continue
+        try:
+            mdl = tf_load_model(
+                p,
+                custom_objects={
+                    "cosine_proximity": _cosine_proximity,
+                    "SeparableConv2D": SeparableConv2D_compat,
+                    "LeakyReLU": LeakyReLU,
+                },
+                compile=False,
+            )
+            return mdl
+        except Exception as e:
+            last_err = e
+    raise FileNotFoundError(f"Could not load model from {candidates}. Last error: {last_err}")
 
 default_lookback = 3 # number of previous tracks to take into account
 default_noise = 0    # amount of randomness to throw in the mix
@@ -237,13 +283,8 @@ def get_mp3tovec(content_string, filename):
         x[slice, :, :, 0] = log_S
     # need to put semaphore around this
     K.clear_session()
-    model = load_model(
-        model_file,
-        custom_objects={
-            'cosine_proximity':
-            tf.compat.v1.keras.losses.cosine_proximity
-        })
-    new_vecs = model.predict(x)
+    model = _load_speccy_model(model_file or "speccy_model")
+    new_vecs = model.predict(x, verbose=0)
     K.clear_session()
     print(f'Spectrogram analysis took {time.time() - start:0.0f}s')
     start = time.time()
@@ -325,7 +366,7 @@ def get_track_info(filename):
     elif filename[-4:].lower() == 'flac':
         audio = FLAC(filename)
         if audio.pictures:
-            for pict in pics:
+            for pict in audio.pictures:
                 if pict.type == 3:
                     im = Image.open(BytesIO(pict.data)).convert('RGB')
                     buff = BytesIO()
@@ -444,28 +485,57 @@ def update_output(contents, jsonified_data, filename, lookback, noise):
     time.sleep(1)
     return [upload, shared]
 
-def relative_path(fileout, track):
-    # Determine if fileout is a file or directory
-    if os.path.isdir(fileout):
-        fileout_dir = fileout
+def relative_path(track, library_root=None, fileout=None):
+    """
+    Return a path suitable for M3U:
+    - If library_root is provided, make the path relative to that root.
+    - If the track is not under library_root, fall back to absolute path.
+    - Otherwise (no library_root), make it relative to the playlist file location.
+    """
+    track_abs = os.path.realpath(track)
+
+    if library_root:
+        root_abs = os.path.realpath(library_root)
+        try:
+            rel = os.path.relpath(track_abs, start=root_abs)
+            # If it escapes the root (starts with '..'), fallback to absolute
+            if rel.startswith('..'):
+                return track_abs
+            return rel
+        except Exception:
+            return track_abs
+
+    # Fallback: relative to the playlist file’s folder
+    if fileout and os.path.isdir(fileout):
+        base = fileout
     else:
-        fileout_dir = os.path.dirname(fileout)
+        base = os.path.dirname(fileout) if fileout else os.getcwd()
+    return os.path.relpath(track_abs, start=os.path.realpath(base))
 
-    # Compute the relative path from fileout directory to tracks
-    relative = os.path.relpath(track, start=fileout_dir)
-    
-    return relative
+def _lib_relative(track, library_root):
+    # path inside library_root, POSIX separators for M3U
+    track_abs = os.path.realpath(track)
+    root_abs  = os.path.realpath(library_root) if library_root else None
+    if root_abs:
+        rel = os.path.relpath(track_abs, start=root_abs)
+    else:
+        # fallback: just the filename
+        rel = os.path.basename(track_abs)
+    return rel.replace(os.sep, "/")
 
-def tracks_to_m3u(fileout, tracks):
-    """
-    using relative path
-    """
+def _m3u_entry(track, library_root=None, playlist_base=None):
+    rel = _lib_relative(track, library_root)
+    if playlist_base is None or playlist_base == "":
+        return rel
+    # Join using POSIX semantics so "../" etc. are preserved cleanly
+    return str(PurePosixPath(playlist_base) / PurePosixPath(rel))
 
-    with open(fileout, 'w') as f:
+def tracks_to_m3u(fileout, tracks, library_root=None, playlist_base=None):
+    with open(fileout, 'w', encoding='utf-8') as f:
         f.write("#EXTM3U\n")
         for item in tracks:
-            relpath = relative_path(fileout, item)
-            f.write(relpath + "\n")
+            f.write(_m3u_entry(item, library_root=library_root,
+                               playlist_base=playlist_base) + "\n")
 
 
 if __name__ == '__main__':
@@ -481,6 +551,9 @@ if __name__ == '__main__':
     parser.add_argument("--nsongs", type=int, help="Requires --playlist option\nNumber of songs in the playlist")
     parser.add_argument("--noise", type=float, help="Requires --playlist option\nAmount of noise in the playlist (default 0)")
     parser.add_argument("--lookback", type=int, help="Requires --playlist option\nAmount of lookback in the playlist (default 3)")
+    parser.add_argument('--libraryroot', type=str, help='Path to Navidrome music root (make M3U entries relative to this)')
+    parser.add_argument('--playlistbase', type=str,
+    help='Prefix to use for each M3U entry (e.g. "../" or absolute base).')
 
     args = parser.parse_args()
     dump_directory = args.pickles
@@ -494,6 +567,9 @@ if __name__ == '__main__':
     n_songs = args.nsongs
     noise = args.noise
     lookback = args.lookback
+    library_root = args.libraryroot
+    playlist_base = args.playlistbase
+    
 
     if model_file == None:
         model_file = 'speccy_model'
@@ -519,6 +595,8 @@ if __name__ == '__main__':
             print("Requested {} songs".format(n_songs))
 
             tracks = make_playlist([input_song], size=n_songs + 1, noise=noise, lookback=lookback)
-            tracks_to_m3u(playlist_outfile, tracks)
+            tracks_to_m3u(playlist_outfile, tracks,
+              library_root=library_root,
+              playlist_base=playlist_base)
         else:
             print("[ERR] Argument --inputsong is required")
