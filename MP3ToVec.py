@@ -11,6 +11,55 @@ import pickle
 from tqdm import tqdm
 import argparse
 import random
+from keras.layers import TFSMLayer
+from pathlib import Path
+
+
+from tensorflow.keras.models import load_model as modern_load_model
+from tensorflow.keras.layers import SeparableConv2D as _SeparableConv2D, LeakyReLU
+
+def SeparableConv2D_compat(*args, **kwargs):
+    # Strip out old/unsupported kwargs
+    for bad in [
+        "groups", "kernel_initializer", "kernel_regularizer", "kernel_constraint",
+        "bias_regularizer", "bias_constraint", "activity_regularizer"
+    ]:
+        kwargs.pop(bad, None)
+    return _SeparableConv2D(*args, **kwargs)
+
+def _cosine_proximity(y_true, y_pred):
+    y_true = tf.math.l2_normalize(y_true, axis=-1)
+    y_pred = tf.math.l2_normalize(y_pred, axis=-1)
+    return -tf.reduce_sum(y_true * y_pred, axis=-1)
+
+def _load_h5_or_keras(model_path: str):
+    """Try to load model from speccy_model (HDF5)."""
+    candidates = [model_path]
+    root, ext = os.path.splitext(model_path)
+    if not ext:
+        candidates += [model_path + ".h5", model_path + ".keras"]
+
+    last_err = None
+    for p in candidates:
+        if not os.path.isfile(p):
+            continue
+        try:
+            mdl = load_model(
+                p,
+                custom_objects={
+                    "cosine_proximity": _cosine_proximity,
+                    "SeparableConv2D": SeparableConv2D_compat,
+                    "LeakyReLU": LeakyReLU,  # <-- key fix
+                },
+                compile=False,
+            )
+            return mdl, int(mdl.input_shape[1]), int(mdl.input_shape[2])
+        except Exception as e:
+            last_err = e
+            continue
+    raise FileNotFoundError(
+        f"Could not load model. Tried: {', '.join(candidates)}. Last error: {last_err}"
+    )
 
 def walkmp3s(folder):
     for dirpath, dirs, files in os.walk(folder, topdown=False):
@@ -30,7 +79,7 @@ if __name__ == '__main__':
     mp3_directory = args.scan
     dump_directory = args.pickles
     mp3tovec_file = args.mp3tovec
-    model_file = args.model
+    model_file      = args.model or "speccy_model"
     batch_size = args.batchsize
     epsilon_distance = args.epsilon
     if model_file == None:
@@ -43,17 +92,12 @@ if __name__ == '__main__':
         os.makedirs(dump_directory + '/mp3tovecs')
     if mp3_directory is not None:
         print(f'Creating Track2Vec matrices')
-        model = load_model(
-            model_file,
-            custom_objects={
-                'cosine_proximity':
-                tf.compat.v1.keras.losses.cosine_proximity
-            })
+        model_path = model_file or 'speccy_model'  # your file is HDF5 even if it has no extension
+        mdl, n_mels, slice_size = _load_h5_or_keras(model_path)
+
         sr         = 22050
         n_fft      = 2048
         hop_length = 512
-        n_mels     = model.input_shape[1]
-        slice_size = model.input_shape[2]
         slice_time = slice_size * hop_length / sr
         files = []
         done = os.listdir(dump_directory)
@@ -78,7 +122,11 @@ if __name__ == '__main__':
                             if np.max(log_S) - np.min(log_S) != 0:
                                 log_S = (log_S - np.min(log_S)) / (np.max(log_S) - np.min(log_S))
                             x[slice, :, :, 0] = log_S
-                        pickle.dump((full_path, model.predict(x, verbose=0)), open(dump_directory + '/' + pickle_filename, 'wb'))
+                        model_out = mdl.predict(x, verbose=0)  # returns np.ndarray
+                        pickle.dump(
+							(full_path, model_out),
+							open(dump_directory + '/' + pickle_filename, 'wb')
+						)
                     except KeyboardInterrupt:
                         raise
                     except:
